@@ -76,12 +76,15 @@ type Job struct {
 }
 
 func init() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	log.SetOutput(os.Stderr)
+
 	flag.UintVar(&THREADS, "N", uint(runtime.NumCPU()), "Number concurent downloads")
 	flag.StringVar(&URL, "I", "", "URL to download")
 	flag.StringVar(&FILE, "F", "", "Download from file instead")
 	flag.StringVar(&OUT, "O", "", "Output file")
 	flag.StringVar(&DEBUG, "D", "", "Debug with pprof (mem|alloc|trace)")
-	flag.Var(myHttpHeader, "H", "Set/Add http header")
+	flag.Var(myHttpHeader, "H", "Set/Add http header 'Key:value'")
 	flag.BoolVar(&insecureSkipVerify, "skip-cert-verification", false, "Skip server cert verification")
 	flag.BoolVar(&followRedirection, "follow-redirection", true, "Follow http redrection 3xx")
 	flag.Parse()
@@ -159,8 +162,6 @@ func main() {
 	}
 
 	defer func() {
-		log.Println("waiting for 1 minute")
-		time.Sleep(1 * time.Minute)
 		close(jobCh)
 		wg.Wait()
 		fmt.Printf("Total: %-07d Success: %-07d Error: %-07d\n", successCounter+errorCounter, successCounter, errorCounter)
@@ -291,10 +292,8 @@ main_loop: /* start main_loop */
 			}
 		}
 
-		log.Println("Spawn file closer go routine")
 		go func(file *os.File, wg *sync.WaitGroup) {
 			wg.Wait()
-			log.Println("Closing file:", file.Name())
 			_ = file.Close()
 		}(outFile, fileWG)
 	} /* end main_loop */
