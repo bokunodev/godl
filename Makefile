@@ -1,2 +1,2 @@
 all:
-	@gobuild -o cmd/godl ./src
+	@gobuild -o cmd/godl ./src/*.go

@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -17,22 +19,27 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
-	"unicode"
 
 	"github.com/pkg/profile"
 	"golang.org/x/net/publicsuffix"
 )
 
 var (
-	DEBUG                        string
 	THREADS                      uint
-	URL, OUT, FILE               string
-	successCounter, errorCounter int
-	counterMutex                 sync.Mutex
+	DEBUG, URL, OUT, FILE        string
+	successCounter, errorCounter int32
+	insecureSkipVerify           bool
+	followRedirection            bool
 	myCookieJar, _               = cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
-	httpClient                   = http.Client{
-		Transport: &http.Transport{
+
+	minContentLength int64 = 2 << 20 // 4MB
+
+	myHttpHeader = make(httpHeader)
+	myTransport  = &transport{
+		httpHeader: myHttpHeader,
+		base: &http.Transport{
 			Proxy: http.ProxyFromEnvironment,
 			DialContext: (&net.Dialer{
 				Timeout:   30 * time.Second,
@@ -47,27 +54,47 @@ var (
 				InsecureSkipVerify: true,
 			},
 		},
-		Jar:     myCookieJar,
-		Timeout: 0,
+	}
+
+	httpClient = http.Client{
+		Transport: myTransport,
+		Jar:       myCookieJar,
+		Timeout:   0,
 	}
 )
 
+type writeAtCloser interface {
+	WriteAt(b []byte, off int64) (n int, err error)
+	io.Closer
+}
+
 type Job struct {
 	io.ReadCloser
-	io.WriteCloser
+	writeAtCloser
+	offset int64
+	wg     *sync.WaitGroup
+}
+
+func init() {
+	flag.UintVar(&THREADS, "N", uint(runtime.NumCPU()), "Number concurent downloads")
+	flag.StringVar(&URL, "I", "", "URL to download")
+	flag.StringVar(&FILE, "F", "", "Download from file instead")
+	flag.StringVar(&OUT, "O", "", "Output file")
+	flag.StringVar(&DEBUG, "D", "", "Debug with pprof (mem|alloc|trace)")
+	flag.Var(myHttpHeader, "H", "Set/Add http header")
+	flag.BoolVar(&insecureSkipVerify, "skip-cert-verification", false, "Skip server cert verification")
+	flag.BoolVar(&followRedirection, "follow-redirection", true, "Follow http redrection 3xx")
+	flag.Parse()
+
+	myTransport.base.TLSClientConfig.InsecureSkipVerify = insecureSkipVerify
+	if !followRedirection {
+		httpClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+	}
 }
 
 func main() {
-	ballast := make([]byte, 10<<20)
-	ballast[0] = 'A'
-
-	flag.UintVar(&THREADS, "N", uint(runtime.NumCPU()), "concurent download")
-	flag.StringVar(&URL, "I", "", "url to download")
-	flag.StringVar(&FILE, "F", "", "downlaod from file instead")
-	flag.StringVar(&OUT, "O", "", "output file")
-	flag.StringVar(&DEBUG, "D", "", "debug with pprof")
-	flag.Parse()
-
 	if DEBUG != "" {
 		var p func(*profile.Profile)
 		switch DEBUG {
@@ -114,44 +141,45 @@ func main() {
 			defer wg.Done()
 			buf := make([]byte, 1<<20)
 			for job := range ch {
-				_, err := io.CopyBuffer(job.WriteCloser, job.ReadCloser, buf)
+				_, err := copyBufferAt(job.writeAtCloser, job.ReadCloser, job.offset, buf)
 				if err != nil {
 					log.Println(err)
-					counterMutex.Lock()
-					errorCounter++
-					counterMutex.Unlock()
+					updateError()
 				} else {
-					counterMutex.Lock()
-					successCounter++
-					counterMutex.Unlock()
+					updateSuccess()
 				}
-				_ = job.WriteCloser.Close()
+				if job.wg == nil {
+					_ = job.writeAtCloser.Close()
+				} else {
+					job.wg.Done()
+				}
 				_ = job.ReadCloser.Close()
 			}
 		}(jobCh, &wg)
 	}
 
 	defer func() {
+		log.Println("waiting for 1 minute")
+		time.Sleep(1 * time.Minute)
 		close(jobCh)
 		wg.Wait()
-		fmt.Printf("Total: %-08d Success: %-08d Error: %-08d\n", successCounter+errorCounter, successCounter, errorCounter)
+		fmt.Printf("Total: %-07d Success: %-07d Error: %-07d\n", successCounter+errorCounter, successCounter, errorCounter)
 	}()
 
+main_loop: /* start main_loop */
 	for line, err := input.readLine(); err == nil; line, err = input.readLine() {
 		index := strings.Index(line, " ")
 		if index < 0 {
 			index = len(line)
 		}
 
-		in, out := trimWhitespace(line[:index]), trimWhitespace(line[index:])
+		in, out := strings.TrimSpace(line[:index]), strings.TrimSpace(line[index:])
 
 		urlObj, err := url.Parse(in)
 		if err != nil {
 			log.Println(err)
-			counterMutex.Lock()
-			errorCounter++
-			counterMutex.Unlock()
-			continue
+			updateError()
+			continue main_loop
 		}
 
 		if urlObj.Scheme == "" {
@@ -160,29 +188,25 @@ func main() {
 
 		req, err := http.NewRequest(http.MethodGet, urlObj.String(), http.NoBody)
 		if err != nil {
-			log.Print(err)
-			counterMutex.Lock()
-			errorCounter++
-			counterMutex.Unlock()
-			continue
+			log.Println(err)
+			updateError()
+			continue main_loop
 		}
 
 		res, err := httpClient.Do(req)
 		if err != nil {
-			log.Print(err)
-			counterMutex.Lock()
-			errorCounter++
-			counterMutex.Unlock()
-			continue
+			log.Println(err)
+			_ = req.Body.Close()
+			updateError()
+			continue main_loop
 		}
 
 		if res.StatusCode > 299 {
 			log.Println(urlObj.String(), "Server response with status:", res.StatusCode, http.StatusText(res.StatusCode))
 			_ = res.Body.Close()
-			counterMutex.Lock()
-			errorCounter++
-			counterMutex.Unlock()
-			continue
+			_ = req.Body.Close()
+			updateError()
+			continue main_loop
 		}
 
 		if out == "" {
@@ -193,10 +217,9 @@ func main() {
 				if out, ok = params["filename"]; err != nil || !ok {
 					log.Println("Can't get filename from url or respose header", err)
 					_ = res.Body.Close()
-					counterMutex.Lock()
-					errorCounter++
-					counterMutex.Unlock()
-					continue
+					_ = req.Body.Close()
+					updateError()
+					continue main_loop
 				}
 			}
 		}
@@ -205,17 +228,110 @@ func main() {
 		if err != nil {
 			log.Println(err)
 			_ = res.Body.Close()
-			counterMutex.Lock()
-			errorCounter++
-			counterMutex.Unlock()
-			continue
+			_ = req.Body.Close()
+			updateError()
+			continue main_loop
 		}
 
-		jobCh <- &Job{
-			ReadCloser:  res.Body,
-			WriteCloser: outFile,
+		if THREADS < 2 || !acceptRanges(res) {
+			log.Println("Server doesn't support range request or THTHREADS is 1")
+			jobCh <- &Job{
+				ReadCloser:    res.Body,
+				writeAtCloser: outFile,
+				offset:        0,
+				wg:            nil,
+			}
+			_ = req.Body.Close()
+			continue main_loop
 		}
+
+		quotient, reminder := res.ContentLength/int64(THREADS), res.ContentLength%int64(THREADS)
+		fileWG := new(sync.WaitGroup)
+	second_loop:
+		for i := int64(0); i < int64(THREADS); i++ {
+			start := quotient * i
+			end := start + quotient
+			req2 := req.Clone(context.Background())
+			req2.Header["Range"] = []string{fmt.Sprintf("bytes=%d-%d", start, end)}
+			res2, err := httpClient.Do(req2)
+			if err != nil {
+				log.Println(err)
+				_ = req2.Body.Close()
+				continue second_loop
+			}
+
+			fileWG.Add(1)
+
+			jobCh <- &Job{
+				ReadCloser:    res2.Body,
+				writeAtCloser: outFile,
+				offset:        start,
+				wg:            fileWG,
+			}
+		}
+
+		if reminder > 0 {
+			start := quotient * int64(THREADS)
+			req3 := req.Clone(context.Background())
+			req3.Header["Range"] = []string{fmt.Sprintf("bytes=%d-", start)}
+			res3, err := httpClient.Do(req3)
+			if err != nil {
+				log.Println(err)
+				_ = req3.Body.Close()
+				continue main_loop
+			}
+
+			fileWG.Add(1)
+
+			jobCh <- &Job{
+				ReadCloser:    res3.Body,
+				writeAtCloser: outFile,
+				offset:        start,
+				wg:            fileWG,
+			}
+		}
+
+		log.Println("Spawn file closer go routine")
+		go func(file *os.File, wg *sync.WaitGroup) {
+			wg.Wait()
+			log.Println("Closing file:", file.Name())
+			_ = file.Close()
+		}(outFile, fileWG)
+	} /* end main_loop */
+}
+
+type transport struct {
+	httpHeader
+	base *http.Transport
+}
+
+func (tr *transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	for k, v := range tr.httpHeader {
+		req.Header.Set(k, v)
 	}
+	return tr.base.RoundTrip(req)
+}
+
+type httpHeader map[string]string
+
+func (h httpHeader) Set(s string) error {
+	idx := strings.Index(s, ":")
+	if idx < 0 {
+		return fmt.Errorf("Invalid arggument value, http header '%s'\n", s)
+	}
+	h[strings.TrimSpace(s[:idx])] = strings.TrimSpace(s[idx:])
+	return nil
+}
+
+func (h httpHeader) String() string {
+	sb := strings.Builder{}
+	for k, v := range h {
+		sb.WriteString(k)
+		sb.Write([]byte{':', ' '})
+		sb.WriteString(v)
+		sb.WriteByte('\n')
+	}
+	return sb.String()
 }
 
 type lineReader struct {
@@ -247,20 +363,52 @@ func (lr *lineReader) readLine() (string, error) {
 	return lr.Builder.String(), err
 }
 
-func trimWhitespace(s string) string {
-	var start, end int
-	end = len(s)
-	for start < end {
-		if unicode.IsLetter(rune(s[start])) {
+func acceptRanges(res *http.Response) bool {
+	_, ok := res.Header["Accept-Ranges"]
+	return ok && res.ContentLength > minContentLength
+}
+
+var errInvalidWrite = errors.New("invalid write result")
+
+func copyBufferAt(dst io.WriterAt, src io.Reader, offset int64, buf []byte) (written int64, err error) {
+	if buf == nil {
+		buf = make([]byte, 32<<10)
+	}
+	for {
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			nw, ew := dst.WriteAt(buf[0:nr], offset)
+			if nw < 0 || nr < nw {
+				nw = 0
+				if ew == nil {
+					ew = errInvalidWrite
+				}
+			}
+			written += int64(nw)
+			offset += int64(nw)
+			if ew != nil {
+				err = ew
+				break
+			}
+			if nr != nw {
+				err = io.ErrShortWrite
+				break
+			}
+		}
+		if er != nil {
+			if er != io.EOF {
+				err = er
+			}
 			break
 		}
-		start++
 	}
-	for start < end {
-		if unicode.IsLetter(rune(s[end-1])) {
-			break
-		}
-		end--
-	}
-	return s[start:end]
+	return written, err
+}
+
+func updateError() {
+	atomic.AddInt32(&errorCounter, 1)
+}
+
+func updateSuccess() {
+	atomic.AddInt32(&successCounter, 1)
 }
