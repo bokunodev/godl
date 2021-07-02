@@ -34,7 +34,7 @@ var (
 	followRedirection            bool
 	myCookieJar, _               = cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
 
-	minContentLength int64 = 2 << 20 // 4MB
+	minContentLength int64 = 4 << 20 // 4MB
 
 	myHttpHeader = make(httpHeader)
 	myTransport  = &transport{
@@ -235,7 +235,6 @@ main_loop: /* start main_loop */
 		}
 
 		if THREADS < 2 || !acceptRanges(res) {
-			log.Println("Server doesn't support range request or THTHREADS is 1")
 			jobCh <- &Job{
 				ReadCloser:    res.Body,
 				writeAtCloser: outFile,
@@ -292,6 +291,8 @@ main_loop: /* start main_loop */
 			}
 		}
 
+		// outFile will be closed by this goroutine.
+		// if main is return earlier, it'll be cleaned up by the OS.
 		go func(file *os.File, wg *sync.WaitGroup) {
 			wg.Wait()
 			_ = file.Close()
