@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/cookiejar"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"path"
@@ -32,6 +33,7 @@ var (
 	successCounter, errorCounter int32
 	insecureSkipVerify           bool
 	followRedirection            bool
+	dumpHeader                   bool
 	myCookieJar, _               = cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
 
 	minContentLength int64 = 4 << 20 // 4MB
@@ -83,10 +85,11 @@ func init() {
 	flag.StringVar(&URL, "I", "", "URL to download")
 	flag.StringVar(&FILE, "F", "", "Download from file instead")
 	flag.StringVar(&OUT, "O", "", "Output file")
-	flag.StringVar(&DEBUG, "D", "", "Debug with pprof (mem|alloc|trace)")
+	flag.StringVar(&DEBUG, "D", "", "Debug with pprof (mem|alloc|trace|cpu)")
 	flag.Var(myHttpHeader, "H", "Set/Add http header 'Key:value'")
 	flag.BoolVar(&insecureSkipVerify, "skip-cert-verification", false, "Skip server cert verification")
 	flag.BoolVar(&followRedirection, "follow-redirection", true, "Follow http redrection 3xx")
+	flag.BoolVar(&dumpHeader, "dump-http-header", false, "Dump http request and respose header to stderr")
 	flag.Parse()
 
 	myTransport.base.TLSClientConfig.InsecureSkipVerify = insecureSkipVerify
@@ -107,6 +110,8 @@ func main() {
 			p = profile.TraceProfile
 		case "alloc":
 			p = profile.MemProfileAllocs
+		case "cpu":
+			p = profile.CPUProfile
 		default:
 			log.Printf("Unrecognized profile '%s'\n", DEBUG)
 			os.Exit(1)
@@ -147,9 +152,9 @@ func main() {
 				_, err := copyBufferAt(job.writeAtCloser, job.ReadCloser, job.offset, buf)
 				if err != nil {
 					log.Println(err)
-					updateError()
+					atomic.AddInt32(&errorCounter, 1)
 				} else {
-					updateSuccess()
+					atomic.AddInt32(&successCounter, 1)
 				}
 				if job.wg == nil {
 					_ = job.writeAtCloser.Close()
@@ -179,7 +184,7 @@ main_loop: /* start main_loop */
 		urlObj, err := url.Parse(in)
 		if err != nil {
 			log.Println(err)
-			updateError()
+			atomic.AddInt32(&errorCounter, 1)
 			continue main_loop
 		}
 
@@ -190,15 +195,15 @@ main_loop: /* start main_loop */
 		req, err := http.NewRequest(http.MethodGet, urlObj.String(), http.NoBody)
 		if err != nil {
 			log.Println(err)
-			updateError()
+			atomic.AddInt32(&errorCounter, 1)
 			continue main_loop
 		}
 
-		res, err := httpClient.Do(req)
+		res, err := doRequest(&httpClient, req, dumpHeader)
 		if err != nil {
 			log.Println(err)
 			_ = req.Body.Close()
-			updateError()
+			atomic.AddInt32(&errorCounter, 1)
 			continue main_loop
 		}
 
@@ -206,7 +211,7 @@ main_loop: /* start main_loop */
 			log.Println(urlObj.String(), "Server response with status:", res.StatusCode, http.StatusText(res.StatusCode))
 			_ = res.Body.Close()
 			_ = req.Body.Close()
-			updateError()
+			atomic.AddInt32(&errorCounter, 1)
 			continue main_loop
 		}
 
@@ -219,7 +224,7 @@ main_loop: /* start main_loop */
 					log.Println("Can't get filename from url or respose header", err)
 					_ = res.Body.Close()
 					_ = req.Body.Close()
-					updateError()
+					atomic.AddInt32(&errorCounter, 1)
 					continue main_loop
 				}
 			}
@@ -230,7 +235,7 @@ main_loop: /* start main_loop */
 			log.Println(err)
 			_ = res.Body.Close()
 			_ = req.Body.Close()
-			updateError()
+			atomic.AddInt32(&errorCounter, 1)
 			continue main_loop
 		}
 
@@ -253,7 +258,7 @@ main_loop: /* start main_loop */
 			end := start + quotient
 			req2 := req.Clone(context.Background())
 			req2.Header["Range"] = []string{fmt.Sprintf("bytes=%d-%d", start, end)}
-			res2, err := httpClient.Do(req2)
+			res2, err := doRequest(&httpClient, req2, dumpHeader)
 			if err != nil {
 				log.Println(err)
 				_ = req2.Body.Close()
@@ -274,7 +279,7 @@ main_loop: /* start main_loop */
 			start := quotient * int64(THREADS)
 			req3 := req.Clone(context.Background())
 			req3.Header["Range"] = []string{fmt.Sprintf("bytes=%d-", start)}
-			res3, err := httpClient.Do(req3)
+			res3, err := doRequest(&httpClient, req3, dumpHeader)
 			if err != nil {
 				log.Println(err)
 				_ = req3.Body.Close()
@@ -405,10 +410,26 @@ func copyBufferAt(dst io.WriterAt, src io.Reader, offset int64, buf []byte) (wri
 	return written, err
 }
 
-func updateError() {
-	atomic.AddInt32(&errorCounter, 1)
-}
-
-func updateSuccess() {
-	atomic.AddInt32(&successCounter, 1)
+func doRequest(cl *http.Client, req *http.Request, dumpheader bool) (*http.Response, error) {
+	if dumpheader {
+		buf, err := httputil.DumpRequestOut(req, false)
+		if err != nil {
+			log.Println(err)
+		} else {
+			os.Stderr.Write(buf)
+		}
+	}
+	res, err := cl.Do(req)
+	if err != nil {
+		return res, err
+	}
+	if dumpheader {
+		buf, err := httputil.DumpResponse(res, false)
+		if err != nil {
+			log.Println(err)
+		} else {
+			os.Stderr.Write(buf)
+		}
+	}
+	return res, err
 }
