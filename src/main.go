@@ -33,13 +33,12 @@ var (
 	successCounter, errorCounter int32
 	insecureSkipVerify           bool
 	followRedirection            bool
-	dumpHeader                   bool
-	myCookieJar, _               = cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
 
 	minContentLength int64 = 4 << 20 // 4MB
+	myCookieJar, _         = cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+	myHttpHeader           = make(httpHeader)
 
-	myHttpHeader = make(httpHeader)
-	myTransport  = &transport{
+	myTransport = &transport{
 		httpHeader: myHttpHeader,
 		base: &http.Transport{
 			Proxy: http.ProxyFromEnvironment,
@@ -89,7 +88,7 @@ func init() {
 	flag.Var(myHttpHeader, "H", "Set/Add http header 'Key:value'")
 	flag.BoolVar(&insecureSkipVerify, "skip-cert-verification", false, "Skip server cert verification")
 	flag.BoolVar(&followRedirection, "follow-redirection", true, "Follow http redrection 3xx")
-	flag.BoolVar(&dumpHeader, "dump-http-header", false, "Dump http request and respose header to stderr")
+	flag.BoolVar(&myTransport.dumpHeader, "dump-http-header", false, "Dump http request and respose header to stderr")
 	flag.Parse()
 
 	myTransport.base.TLSClientConfig.InsecureSkipVerify = insecureSkipVerify
@@ -199,7 +198,7 @@ main_loop: /* start main_loop */
 			continue main_loop
 		}
 
-		res, err := doRequest(&httpClient, req, dumpHeader)
+		res, err := httpClient.Do(req)
 		if err != nil {
 			log.Println(err)
 			_ = req.Body.Close()
@@ -258,7 +257,7 @@ main_loop: /* start main_loop */
 			end := start + quotient
 			req2 := req.Clone(context.Background())
 			req2.Header["Range"] = []string{fmt.Sprintf("bytes=%d-%d", start, end)}
-			res2, err := doRequest(&httpClient, req2, dumpHeader)
+			res2, err := httpClient.Do(req2)
 			if err != nil {
 				log.Println(err)
 				_ = req2.Body.Close()
@@ -279,7 +278,7 @@ main_loop: /* start main_loop */
 			start := quotient * int64(THREADS)
 			req3 := req.Clone(context.Background())
 			req3.Header["Range"] = []string{fmt.Sprintf("bytes=%d-", start)}
-			res3, err := doRequest(&httpClient, req3, dumpHeader)
+			res3, err := httpClient.Do(req3)
 			if err != nil {
 				log.Println(err)
 				_ = req3.Body.Close()
@@ -306,6 +305,7 @@ main_loop: /* start main_loop */
 }
 
 type transport struct {
+	dumpHeader bool
 	httpHeader
 	base *http.Transport
 }
@@ -314,7 +314,25 @@ func (tr *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	for k, v := range tr.httpHeader {
 		req.Header.Set(k, v)
 	}
-	return tr.base.RoundTrip(req)
+	res, err := tr.base.RoundTrip(req)
+	if err != nil {
+		return res, err
+	}
+	if tr.dumpHeader {
+		buf, err := httputil.DumpRequestOut(req, false)
+		if err != nil {
+			log.Println(err)
+		} else {
+			os.Stderr.Write(buf)
+		}
+		buf, err = httputil.DumpResponse(res, false)
+		if err != nil {
+			log.Println(err)
+		} else {
+			os.Stderr.Write(buf)
+		}
+	}
+	return res, err
 }
 
 type httpHeader map[string]string
@@ -408,28 +426,4 @@ func copyBufferAt(dst io.WriterAt, src io.Reader, offset int64, buf []byte) (wri
 		}
 	}
 	return written, err
-}
-
-func doRequest(cl *http.Client, req *http.Request, dumpheader bool) (*http.Response, error) {
-	if dumpheader {
-		buf, err := httputil.DumpRequestOut(req, false)
-		if err != nil {
-			log.Println(err)
-		} else {
-			os.Stderr.Write(buf)
-		}
-	}
-	res, err := cl.Do(req)
-	if err != nil {
-		return res, err
-	}
-	if dumpheader {
-		buf, err := httputil.DumpResponse(res, false)
-		if err != nil {
-			log.Println(err)
-		} else {
-			os.Stderr.Write(buf)
-		}
-	}
-	return res, err
 }
