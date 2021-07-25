@@ -28,7 +28,7 @@ import (
 )
 
 var (
-	THREADS                      uint
+	THREADS, NPARTS              uint
 	DEBUG, URL, OUT, FILE        string
 	successCounter, errorCounter int32
 	insecureSkipVerify           bool
@@ -80,11 +80,12 @@ func init() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.SetOutput(os.Stderr)
 
-	flag.UintVar(&THREADS, "N", uint(runtime.NumCPU()), "Number concurent downloads")
-	flag.StringVar(&URL, "I", "", "URL to download")
-	flag.StringVar(&FILE, "F", "", "Download from file instead")
-	flag.StringVar(&OUT, "O", "", "Output file")
-	flag.StringVar(&DEBUG, "D", "", "Debug with pprof (mem|alloc|trace|cpu)")
+	flag.UintVar(&THREADS, "t", uint(runtime.NumCPU()), "Number concurent downloads")
+	flag.UintVar(&NPARTS, "p", uint(runtime.NumCPU()), "Split file into N parts")
+	flag.StringVar(&URL, "i", "", "URL to download")
+	flag.StringVar(&FILE, "f", "", "Download from file instead")
+	flag.StringVar(&OUT, "o", "", "Output file")
+	flag.StringVar(&DEBUG, "d", "", "Enable pprof (mem|alloc|trace|cpu)")
 	flag.Var(myHttpHeader, "H", "Set/Add http header 'Key:value'")
 	flag.BoolVar(&insecureSkipVerify, "skip-cert-verification", false, "Skip server cert verification")
 	flag.BoolVar(&followRedirection, "follow-redirection", true, "Follow http redrection 3xx")
@@ -238,7 +239,7 @@ main_loop: /* start main_loop */
 			continue main_loop
 		}
 
-		if THREADS < 2 || !acceptRanges(res) {
+		if NPARTS < 2 || !acceptRanges(res) {
 			jobCh <- &Job{
 				ReadCloser:    res.Body,
 				writeAtCloser: outFile,
@@ -249,10 +250,10 @@ main_loop: /* start main_loop */
 			continue main_loop
 		}
 
-		quotient, reminder := res.ContentLength/int64(THREADS), res.ContentLength%int64(THREADS)
+		quotient, reminder := res.ContentLength/int64(NPARTS), res.ContentLength%int64(NPARTS)
 		fileWG := new(sync.WaitGroup)
 	second_loop:
-		for i := int64(0); i < int64(THREADS); i++ {
+		for i := int64(0); i < int64(NPARTS); i++ {
 			start := quotient * i
 			end := start + quotient
 			req2 := req.Clone(context.Background())
@@ -275,7 +276,7 @@ main_loop: /* start main_loop */
 		}
 
 		if reminder > 0 {
-			start := quotient * int64(THREADS)
+			start := quotient * int64(NPARTS)
 			req3 := req.Clone(context.Background())
 			req3.Header["Range"] = []string{fmt.Sprintf("bytes=%d-", start)}
 			res3, err := httpClient.Do(req3)
