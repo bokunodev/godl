@@ -28,12 +28,13 @@ import (
 )
 
 var (
-	THREADS, NPARTS              uint
+	NTHREADS, NPARTS             uint
 	DEBUG, URL, OUT, FILE        string
 	successCounter, errorCounter int32
 	insecureSkipVerify           bool
 	followRedirection            bool
 
+	// minimum content size, smaller than this will use single connection
 	minContentLength int64 = 4 << 20 // 4MB
 	myCookieJar, _         = cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
 	myHttpHeader           = make(httpHeader)
@@ -80,12 +81,12 @@ func init() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.SetOutput(os.Stderr)
 
-	flag.UintVar(&THREADS, "t", uint(runtime.NumCPU()), "Number concurent downloads")
+	flag.UintVar(&NTHREADS, "t", uint(runtime.NumCPU()), "Number concurent downloads")
 	flag.UintVar(&NPARTS, "p", uint(runtime.NumCPU()), "Split file into N parts")
 	flag.StringVar(&URL, "i", "", "URL to download")
 	flag.StringVar(&FILE, "f", "", "Download from file instead")
 	flag.StringVar(&OUT, "o", "", "Output file")
-	flag.StringVar(&DEBUG, "d", "", "Enable pprof (mem|alloc|trace|cpu)")
+	flag.StringVar(&DEBUG, "D", "", "Enable pprof (mem|alloc|trace|cpu)")
 	flag.Var(myHttpHeader, "H", "Set/Add http header 'Key:value'")
 	flag.BoolVar(&insecureSkipVerify, "skip-cert-verification", false, "Skip server cert verification")
 	flag.BoolVar(&followRedirection, "follow-redirection", true, "Follow http redrection 3xx")
@@ -141,9 +142,9 @@ func main() {
 		}
 	}
 
-	jobCh := make(chan *Job, THREADS)
+	jobCh := make(chan *Job, NTHREADS)
 	var wg sync.WaitGroup
-	for i := uint(0); i < THREADS; i++ {
+	for i := uint(0); i < NTHREADS; i++ {
 		wg.Add(1)
 		go func(ch chan *Job, wg *sync.WaitGroup) {
 			defer wg.Done()
@@ -172,7 +173,6 @@ func main() {
 		fmt.Printf("Total: %-07d Success: %-07d Error: %-07d\n", successCounter+errorCounter, successCounter, errorCounter)
 	}()
 
-main_loop: /* start main_loop */
 	for line, err := input.readLine(); err == nil; line, err = input.readLine() {
 		index := strings.Index(line, " ")
 		if index < 0 {
@@ -185,7 +185,7 @@ main_loop: /* start main_loop */
 		if err != nil {
 			log.Println(err)
 			atomic.AddInt32(&errorCounter, 1)
-			continue main_loop
+			continue
 		}
 
 		if urlObj.Scheme == "" {
@@ -196,7 +196,7 @@ main_loop: /* start main_loop */
 		if err != nil {
 			log.Println(err)
 			atomic.AddInt32(&errorCounter, 1)
-			continue main_loop
+			continue
 		}
 
 		res, err := httpClient.Do(req)
@@ -204,7 +204,7 @@ main_loop: /* start main_loop */
 			log.Println(err)
 			_ = req.Body.Close()
 			atomic.AddInt32(&errorCounter, 1)
-			continue main_loop
+			continue
 		}
 
 		if res.StatusCode > 299 {
@@ -212,7 +212,7 @@ main_loop: /* start main_loop */
 			_ = res.Body.Close()
 			_ = req.Body.Close()
 			atomic.AddInt32(&errorCounter, 1)
-			continue main_loop
+			continue
 		}
 
 		if out == "" {
@@ -225,84 +225,23 @@ main_loop: /* start main_loop */
 					_ = res.Body.Close()
 					_ = req.Body.Close()
 					atomic.AddInt32(&errorCounter, 1)
-					continue main_loop
+					continue
 				}
 			}
 		}
 
-		outFile, err := os.OpenFile(out, os.O_CREATE|os.O_RDWR, 0666)
-		if err != nil {
+
+		 jobs, err:=splitRequest(req,res,out,int(NPARTS))
+		if err!=nil {
 			log.Println(err)
-			_ = res.Body.Close()
-			_ = req.Body.Close()
-			atomic.AddInt32(&errorCounter, 1)
-			continue main_loop
+			continue
 		}
 
-		if NPARTS < 2 || !acceptRanges(res) {
-			jobCh <- &Job{
-				ReadCloser:    res.Body,
-				writeAtCloser: outFile,
-				offset:        0,
-				wg:            nil,
-			}
-			_ = req.Body.Close()
-			continue main_loop
+		for _,each :=range jobs {
+			jobCh<-each
 		}
 
-		quotient, reminder := res.ContentLength/int64(NPARTS), res.ContentLength%int64(NPARTS)
-		fileWG := new(sync.WaitGroup)
-	second_loop:
-		for i := int64(0); i < int64(NPARTS); i++ {
-			start := quotient * i
-			end := start + quotient
-			req2 := req.Clone(context.Background())
-			req2.Header["Range"] = []string{fmt.Sprintf("bytes=%d-%d", start, end)}
-			res2, err := httpClient.Do(req2)
-			if err != nil {
-				log.Println(err)
-				_ = req2.Body.Close()
-				continue second_loop
-			}
-
-			fileWG.Add(1)
-
-			jobCh <- &Job{
-				ReadCloser:    res2.Body,
-				writeAtCloser: outFile,
-				offset:        start,
-				wg:            fileWG,
-			}
-		}
-
-		if reminder > 0 {
-			start := quotient * int64(NPARTS)
-			req3 := req.Clone(context.Background())
-			req3.Header["Range"] = []string{fmt.Sprintf("bytes=%d-", start)}
-			res3, err := httpClient.Do(req3)
-			if err != nil {
-				log.Println(err)
-				_ = req3.Body.Close()
-				continue main_loop
-			}
-
-			fileWG.Add(1)
-
-			jobCh <- &Job{
-				ReadCloser:    res3.Body,
-				writeAtCloser: outFile,
-				offset:        start,
-				wg:            fileWG,
-			}
-		}
-
-		// outFile will be closed by this goroutine.
-		// if main is return earlier, it'll be cleaned up by the OS.
-		go func(file *os.File, wg *sync.WaitGroup) {
-			wg.Wait()
-			_ = file.Close()
-		}(outFile, fileWG)
-	} /* end main_loop */
+	}
 }
 
 type transport struct {
@@ -427,4 +366,85 @@ func copyBufferAt(dst io.WriterAt, src io.Reader, offset int64, buf []byte) (wri
 		}
 	}
 	return written, err
+}
+
+func splitRequest(req *http.Request ,res *http.Response, fname string, nparts int) ([]*Job, error) {
+	var (
+		jobs []*Job
+		outFile *os.File
+		err error
+	)
+
+	outFile, err = os.OpenFile(fname, os.O_CREATE|os.O_RDWR, 0666)
+	if err != nil {
+		_ = res.Body.Close()
+		_ = req.Body.Close()
+		atomic.AddInt32(&errorCounter, 1)
+		return nil,err
+	}
+
+	if nparts < 2 || !acceptRanges(res) {
+		jobs = append(jobs,&Job{
+			ReadCloser:    res.Body,
+			writeAtCloser: outFile,
+			offset:        0,
+			wg:            nil,
+		})
+		_ = req.Body.Close()
+		return  jobs, nil
+	}
+
+	quotient, reminder := res.ContentLength/int64(nparts), res.ContentLength%int64(nparts)
+	fileWG := &sync.WaitGroup{}
+	for i := int64(0); i < int64(nparts); i++ {
+		start := quotient * i
+		end := start + quotient
+		req2 := req.Clone(context.Background())
+		req2.Header["Range"] = []string{fmt.Sprintf("bytes=%d-%d", start, end)}
+		res2, err := httpClient.Do(req2)
+		if err != nil {
+			log.Println(err)
+			_ = req2.Body.Close()
+			continue
+		}
+
+		fileWG.Add(1)
+
+		jobs=append(jobs,&Job{
+			ReadCloser:    res2.Body,
+			writeAtCloser: outFile,
+			offset:        start,
+			wg:            fileWG,
+		})
+	}
+	if reminder > 0 {
+		start := quotient * int64(nparts)
+		req3 := req.Clone(context.Background())
+		req3.Header["Range"] = []string{fmt.Sprintf("bytes=%d-", start)}
+		res3, err := httpClient.Do(req3)
+		if err != nil {
+			log.Println(err)
+			_ = req3.Body.Close()
+			return nil,err
+		}
+
+		fileWG.Add(1)
+
+		jobs=append(jobs,			 &Job{
+			ReadCloser:    res3.Body,
+			writeAtCloser: outFile,
+			offset:        start,
+			wg:            fileWG,
+		}			)
+	}
+
+
+	// outFile will be closed by this goroutine.
+	// if main is return earlier, it'll be cleaned up by the OS.
+	go func(file *os.File, wg *sync.WaitGroup) {
+		wg.Wait()
+		_ = file.Close()
+	}(outFile, fileWG)
+
+	return jobs,err
 }
