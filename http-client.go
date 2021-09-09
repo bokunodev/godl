@@ -93,14 +93,22 @@ func newHttpClient(insecure, useDOH, dump, follow bool, timeout time.Duration, h
 		baseTransport: &http.Transport{
 			Proxy: http.ProxyFromEnvironment,
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				ip, err := resolve(addr, "A")
+				host, port, err := net.SplitHostPort(addr)
 				if err != nil {
-					ip, err = resolve(addr, "AAAA")
+					return nil, err
+				}
+
+				if useDOH {
+					host, err = resolve(host, "A")
 					if err != nil {
-						log.Fatal(err)
+						host, err = resolve(host, "AAAA")
+						if err != nil {
+							log.Fatal(err)
+						}
 					}
 				}
-				return dialer.DialContext(ctx, network, ip)
+
+				return dialer.DialContext(ctx, network, net.JoinHostPort(host, port))
 			},
 			ForceAttemptHTTP2:     true,
 			MaxIdleConns:          100,
@@ -154,7 +162,14 @@ func resolve(s string, qtype string) (string, error) {
 		return "", errors.New(resmsg.RCode.String())
 	}
 
-	ip = resmsg.Answers[0].Body.GoString()
+	switch resmsg.Answers[0].Header.Type {
+	case dnsmessage.TypeA:
+		AR, _ := resmsg.Answers[0].Body.(*dnsmessage.AResource)
+		ip = net.IP(AR.A[:]).String()
+	case dnsmessage.TypeAAAA:
+		AR, _ := resmsg.Answers[0].Body.(*dnsmessage.AAAAResource)
+		ip = net.IP(AR.AAAA[:]).String()
+	}
 
 	cache[s] = ip
 	return ip, nil
