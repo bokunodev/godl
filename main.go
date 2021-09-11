@@ -58,7 +58,7 @@ func init() {
 	flag.BoolVar(&skipCertVerification, "skip-cert-verification", false, "skip server cert verification")
 	flag.BoolVar(&follow, "follow-redirection", true, "follow redirection 3xx")
 	flag.BoolVar(&dump, "dump-http-header", false, "print http request and respose header")
-	flag.BoolVar(&useDoh, "use-doh", false, "use dns-over-https")
+	flag.BoolVar(&useDoh, "use-doh", false, "use google's dns-over-https server")
 	flag.Parse()
 }
 
